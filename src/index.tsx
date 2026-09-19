@@ -73,6 +73,14 @@ async function optionalApiList(path: string): Promise<{items:KubeObject[]; error
   catch (caught) { return {items:[], error:String(caught)}; }
 }
 
+async function mapLimited<T,R>(items:T[], limit:number, worker:(item:T)=>Promise<R>):Promise<R[]> {
+  const results=new Array<R>(items.length); let cursor=0;
+  await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{
+    while (cursor<items.length) { const index=cursor++; results[index]=await worker(items[index]); }
+  }));
+  return results;
+}
+
 function quantity(value: unknown): number {
   const raw=String(value ?? '').trim();
   if (!raw) return 0;
@@ -128,11 +136,12 @@ function Dashboard() {
   const [requestableClass, setRequestableClass] = useState('compute.workload.v1');
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [traceFilter, setTraceFilter] = useState('');
+  const [eventStage, setEventStage] = useState('');
 
   async function refresh() {
     setLoading(true); setError('');
     try {
-      const metricResults=await Promise.all(METRICS.map(metric=>instantQuery(metric).then(items=>({items,error:''})).catch(caught=>({items:[] as Sample[],error:String(caught)}))));
+      const metricResults=await mapLimited([...METRICS],3,metric=>instantQuery(metric).then(items=>({items,error:''})).catch(caught=>({items:[] as Sample[],error:String(caught)})));
       const results=metricResults.map(result=>result.items);
       const paths=[
         '/apis/tenancy.re8ch.com/v1alpha1/tenants','/apis/tenancy.re8ch.com/v1alpha1/tenantidentitybindings','/apis/tenancy.re8ch.com/v1alpha1/tenantgrants',
@@ -141,7 +150,9 @@ function Dashboard() {
         '/apis/finops.re8ch.com/v1alpha1/clusterconnections','/apis/finops.re8ch.com/v1alpha1/consumptionbindings','/apis/finops.re8ch.com/v1alpha1/consumables',
         '/apis/tenancy.re8ch.com/v1alpha1/tenantresourceclaims','/api/v1/resourcequotas','/api/v1/nodes','/apis/events.k8s.io/v1/events','/api/v1/pods','/api/v1/persistentvolumeclaims',
       ];
-      const kubeResults=await Promise.all(paths.map(optionalApiList));
+      // Headlamp shares its Kubernetes proxy with core discovery/watch calls.
+      // Keep this snapshot bounded so opening the panel cannot cause API 429s.
+      const kubeResults=await mapLimited(paths,4,optionalApiList);
       const [tenantObjects, identityObjects, grantObjects, registrations, namespaceObjects, deployments, statefulSets, daemonSets, jobs, cronJobs, nuclioFunctions, instances, clusterConnections, bindings, consumableObjects, claims, quotas, nodeObjects, events, podObjects, pvcObjects]=kubeResults.map(result=>result.items);
       setSourceErrors([...new Set([...metricResults.map(x=>x.error),...kubeResults.map(x=>x.error)].filter(Boolean))]);
       const typedWorkloads = [
@@ -282,7 +293,7 @@ function Dashboard() {
     ...resourceClaims.filter(item=>!tenant || item.spec?.tenantRef===tenant).map(item=>eventOf({...item,kind:'TenantResourceClaim'},'invoke',String(item.status?.phase || item.spec?.desiredState || 'Pending'),`${item.spec?.capability || '-'} · ttl ${item.spec?.ttlSeconds || '-'}s`)),
     ...visibleWorkloads.map(item=>eventOf(item,'runtime',String(item.status?.readyReplicas || item.status?.active || 0 ? 'Running' : 'Allocated'),`compute.workload.v1 → CPU/RAM/网络派生占用`,item.metadata?.creationTimestamp)),
     ...clusterEvents.filter(item=>!tenant || (item.metadata?.namespace ? tenantNamespaces.has(item.metadata.namespace) : true)).map(item=>eventOf(item,'kubernetes',String(item.reason || 'Event'),String(item.note || item.message || ''),String(item.eventTime || item.lastTimestamp || item.metadata?.creationTimestamp || ''))),
-  ].filter(item=>(!tenant || item.tenant===tenant || item.tenant==='-') && (!traceFilter || `${item.trace} ${item.resource} ${item.detail}`.toLowerCase().includes(traceFilter.toLowerCase()))).sort((a,b)=>Date.parse(b.time || '0')-Date.parse(a.time || '0')).slice(0,100);
+  ].filter(item=>(!tenant || item.tenant===tenant || item.tenant==='-') && (!eventStage || item.stage===eventStage) && (!traceFilter || `${item.trace} ${item.resource} ${item.detail}`.toLowerCase().includes(traceFilter.toLowerCase()))).sort((a,b)=>Date.parse(b.time || '0')-Date.parse(a.time || '0')).slice(0,100);
   const traceCount=new Set(factEvents.map(event=>event.trace).filter(value=>value && value!=='-')).size;
 
   return <Box sx={{p: 2}}>
@@ -291,7 +302,7 @@ function Dashboard() {
       <Button variant="outlined" onClick={() => void refresh()} disabled={loading}>{loading ? '读取中…' : '刷新'}</Button>
     </Box>
     <Alert severity={loading ? 'info' : sourceErrors.length || error ? 'warning' : 'success'} sx={{mb:2}}>
-      Kubernetes 对象是事实来源；Birfucate 指标仅补充计量。{loading ? ' 正在等待各事实来源，当前数字不作为最终事实。' : sourceErrors.length || error ? ` ${sourceErrors.length + (error ? 1 : 0)} 个采集端点超时或不可用；未知值不会显示为容量 0。` : ' 当前采集端点正常。'}
+      {loading ? '正在读取事实来源…' : sourceErrors.length || error ? `${sourceErrors.length + (error ? 1 : 0)} 个来源不可用；未知值不记为 0。` : '事实来源正常。'}
     </Alert>
     <Box sx={{display:'flex',gap:2,flexWrap:'wrap',mb:2}}>
       <FormControl size="small" sx={{minWidth:180}}><InputLabel>Tenant</InputLabel><Select value={tenant} label="Tenant" onChange={e=>setTenant(String(e.target.value))}><MenuItem value="">全部</MenuItem>{tenants.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}</Select></FormControl>
@@ -319,7 +330,10 @@ function Dashboard() {
       ] as any}/>
     </SectionBox>
     <SectionBox title={`租户资源转换轨迹 (${factEvents.length})`}>
-      <Alert severity="info" sx={{mb:1}}>按 Tenant 与 Trace / task 筛选：申请（invoke）→ 绑定/分配 → runtime 派生占用 → Kubernetes 释放事件。轨迹只陈述已观测事实；Watch 断流期间缺失的释放事件会标记为数据源不可用，不反推为“仍占用”。</Alert>
+      <Box sx={{display:'flex',gap:1,mb:1,alignItems:'center'}}>
+        <FormControl size="small" sx={{minWidth:180}}><InputLabel>阶段</InputLabel><Select value={eventStage} label="阶段" onChange={e=>setEventStage(String(e.target.value))}><MenuItem value="">全部阶段</MenuItem>{['invoke','allocation','binding','runtime','kubernetes','grant'].map(stage=><MenuItem key={stage} value={stage}>{stage}</MenuItem>)}</Select></FormControl>
+        <Typography variant="caption" color="text.secondary">申请 → 分配 → 运行 → 释放</Typography>
+      </Box>
       <Table data={factEvents} columns={[
         {header:'Time',accessorFn:(x:FactEvent)=><Typography variant="caption">{compactTime(x.time)}</Typography>},
         {header:'Trace / task',accessorFn:(x:FactEvent)=><Typography variant="caption" sx={{fontFamily:'monospace'}}>{x.trace}</Typography>},
@@ -340,7 +354,6 @@ function Dashboard() {
       ] as any}/>
     </SectionBox>
     <SectionBox title="租户可申请资源（Consumables）">
-      <Alert severity="info" sx={{mb:1}}>租户只能申请这里的资源类。Workload、Sandbox 等获批并运行后，才会派生 CPU、内存和网络占用。</Alert>
       <Tabs value={requestableClass} onChange={(_event,value)=>setRequestableClass(value)} variant="scrollable" scrollButtons="auto" aria-label="Requestable resource type">
         {requestableResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
       </Tabs>
@@ -348,7 +361,6 @@ function Dashboard() {
       <ResourceCorridors resourceClass={requestableClass} unit={requestableClass==='compute.workload.v1'?(pods.length?'pods':'controllers'):capacityFacts.find(item=>item.resourceClass===requestableClass)?.unit || 'instances'} lanes={lanesFor(requestableClass)} capacity={capacityFor(requestableClass)}/>
     </SectionBox>
     <SectionBox title="派生资源占用（不可直接申请）">
-      <Alert severity="info" sx={{mb:1}}>CPU、内存和网络不是租户申请对象；这里按 Workload / Sandbox 的实际运行规格与计量，将派生占用归属到租户。</Alert>
       <Tabs value={derivedClass} onChange={(_event,value)=>setDerivedClass(value)} variant="scrollable" scrollButtons="auto" aria-label="Derived resource type">
         {derivedResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
       </Tabs>
