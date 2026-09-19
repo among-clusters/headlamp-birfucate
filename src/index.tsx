@@ -3,6 +3,7 @@ import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { SectionBox, StatusLabel, Table } from '@kinvolk/headlamp-plugin/lib/components/common';
 import { Alert, Box, Button, Chip, FormControl, InputLabel, MenuItem, Select, Tab, Tabs, TextField, Typography } from '@mui/material';
 import React, { useEffect, useMemo, useState } from 'react';
+import { AllocationLane, ResourceCorridors } from './ResourceCorridors';
 import { TENANT_TOOL_GROUPS, ToolGroup } from './tenant-tool-catalog';
 
 const BIRFUCATE_PROXY = '/api/v1/namespaces/observability-ai/services/http:birfucate-metering:9791/proxy';
@@ -27,7 +28,6 @@ type TenantView = {
   businessNamespaces: string[]; observedNamespaces: string[];
   identities: KubeObject[]; grants: KubeObject[]; registrations: KubeObject[];
 };
-type AllocationLane = {tenant:string; allocated:number; observed:number; evidence:string};
 type Row = {
   tenant: string; resource: string; domain: string; meter: string;
   occupancy: number; occupiedTime: number; occurrences: number;
@@ -51,14 +51,21 @@ async function instantQuery(query: string): Promise<Sample[]> {
   // request() binds the URL to Headlamp's currently selected cluster. Calling
   // clusterRequest() without that cluster silently targets the Headlamp SPA and
   // returns index.html, which then fails JSON parsing at "<!DOCTYPE".
-  const response: any = await request(path, {method: 'GET'});
+  const response: any = await withTimeout(request(path, {method: 'GET'}), `Birfucate metric ${query}`);
   if (response?.status !== 'success') throw new Error(response?.error || 'Birfucate query failed');
   return response?.data?.result || [];
 }
 
 async function apiList(path: string): Promise<KubeObject[]> {
-  const response: any = await request(path, {method: 'GET'});
+  const response: any = await withTimeout(request(path, {method: 'GET'}), path);
   return response?.items || [];
+}
+
+async function withTimeout<T>(promise: Promise<T>, source: string, milliseconds=8000): Promise<T> {
+  return await Promise.race([
+    promise,
+    new Promise<T>((_resolve,reject)=>setTimeout(()=>reject(new Error(`${source} timed out after ${milliseconds}ms`)),milliseconds)),
+  ]);
 }
 
 async function optionalApiList(path: string): Promise<{items:KubeObject[]; error:string}> {
@@ -94,18 +101,6 @@ function objectTrace(item:KubeObject):string {
 
 function key(labels: Labels): string {
   return [labels.tenant || '', labels.resource_ref || '', labels.domain || '', labels.meter || ''].join('\u0000');
-}
-
-function ResourceCorridors({resourceClass, lanes, capacity}: {resourceClass:string; lanes:AllocationLane[]; capacity:number|null}) {
-  const allocated=lanes.reduce((sum,lane)=>sum+lane.allocated,0);
-  const remainder=capacity == null ? null : Math.max(0,capacity-allocated);
-  const display=[...lanes,...(remainder == null ? [] : [{tenant:'未分配',allocated:remainder,observed:0,evidence:'容量上限 − 已分配'}])];
-  const height=Math.max(190,display.length*62+55); const max=Math.max(...display.map(x=>x.allocated),1);
-  return <Box sx={{overflowX:'auto'}}><svg role="img" aria-label={`${resourceClass} allocation corridors`} viewBox={`0 0 960 ${height}`} style={{minWidth:760,width:'100%',height}}>
-    <rect x="24" y={height/2-38} width="190" height="76" rx="12" fill="#263238"/><text x="119" y={height/2-8} textAnchor="middle" fill="white" fontSize="16" fontWeight="700">{resourceClass}</text><text x="119" y={height/2+17} textAnchor="middle" fill="white" fontSize="12">{capacity == null ? '可出租上限未声明' : `总量 ${human(capacity)}`}</text>
-    {display.map((lane,index)=>{const y=48+index*62;const width=3+Math.min(25,(lane.allocated/max)*22);const color=lane.tenant==='未分配'?'#90a4ae':'#5c6bc0';return <g key={lane.tenant}><path d={`M 214 ${height/2} C 350 ${height/2}, 430 ${y}, 600 ${y}`} fill="none" stroke={color} strokeWidth={width} opacity=".78"/><rect x="600" y={y-23} width="330" height="46" rx="8" fill={color} opacity={lane.tenant==='未分配'?'.35':'.9'}/><text x="618" y={y-4} fill="white" fontSize="14" fontWeight="700">{lane.tenant}</text><text x="618" y={y+14} fill="white" fontSize="11">分配 {human(lane.allocated)} · 观测 {human(lane.observed)} · {lane.evidence}</text></g>})}
-    {!display.length&&<text x="600" y={height/2} fill="currentColor">尚无租户分配事实；容量上限也未声明</text>}
-  </svg></Box>;
 }
 
 function Dashboard() {
@@ -232,11 +227,11 @@ function Dashboard() {
     const hard=item.status?.hard || item.spec?.hard || {}; const used=item.status?.used || {};
     return Object.keys(hard).map(dimension=>({id:`quota:${item.metadata?.namespace}:${item.metadata?.name}:${dimension}`,resourceClass:dimension,source:'ResourceQuota',unit:dimension,capacity:quantity(hard[dimension]),allocated:quantity(hard[dimension]),used:quantity(used[dimension]),scope:item.metadata?.namespace || '-',evidence:`${item.metadata?.namespace}/${item.metadata?.name}`}));
   });
-  const nodeCapacity=(field:string)=>nodes.reduce((sum,item)=>sum+quantity(item.status?.allocatable?.[field]),0);
+  const nodeCapacity=(field:string):number|null=>nodes.length ? nodes.reduce((sum,item)=>sum+quantity(item.status?.allocatable?.[field]),0) : null;
   const clusterFacts:CapacityFact[]=[
-    {id:'cluster:cpu',resourceClass:'cluster.cpu',source:'Node.status.allocatable',unit:'cores',capacity:nodeCapacity('cpu'),allocated:quotaFacts.filter(x=>x.resourceClass.includes('cpu')).reduce((sum,x)=>sum+x.allocated,0),used:null,scope:'cluster',evidence:`${nodes.length} nodes`},
-    {id:'cluster:memory',resourceClass:'cluster.memory',source:'Node.status.allocatable',unit:'bytes',capacity:nodeCapacity('memory'),allocated:quotaFacts.filter(x=>x.resourceClass.includes('memory')).reduce((sum,x)=>sum+x.allocated,0),used:null,scope:'cluster',evidence:`${nodes.length} nodes`},
-    {id:'cluster:pods',resourceClass:'cluster.pods',source:'Node.status.allocatable',unit:'pods',capacity:nodeCapacity('pods'),allocated:quotaFacts.filter(x=>x.resourceClass==='pods').reduce((sum,x)=>sum+x.allocated,0),used:visibleWorkloads.length,scope:'cluster',evidence:`${nodes.length} nodes`},
+    {id:'cluster:cpu',resourceClass:'cluster.cpu',source:'Node.status.allocatable',unit:'cores',capacity:nodeCapacity('cpu'),allocated:quotaFacts.filter(x=>x.resourceClass.includes('cpu')).reduce((sum,x)=>sum+x.allocated,0),used:null,scope:'cluster',evidence:nodes.length?`${nodes.length} nodes`:'节点来源不可读'},
+    {id:'cluster:memory',resourceClass:'cluster.memory',source:'Node.status.allocatable',unit:'bytes',capacity:nodeCapacity('memory'),allocated:quotaFacts.filter(x=>x.resourceClass.includes('memory')).reduce((sum,x)=>sum+x.allocated,0),used:null,scope:'cluster',evidence:nodes.length?`${nodes.length} nodes`:'节点来源不可读'},
+    {id:'cluster:pods',resourceClass:'cluster.pods',source:'Node.status.allocatable',unit:'pods',capacity:nodeCapacity('pods'),allocated:quotaFacts.filter(x=>x.resourceClass==='pods').reduce((sum,x)=>sum+x.allocated,0),used:pods.length?visibleWorkloads.length:null,scope:'cluster',evidence:nodes.length?`${nodes.length} nodes`:'节点来源不可读'},
   ];
   const consumableFacts:CapacityFact[]=consumables.filter(item=>item.spec?.lifecycle==='Approved').map(item=>{
     const resourceClass=String(item.spec?.serviceClass || item.metadata?.name || 'unknown');
@@ -251,18 +246,25 @@ function Dashboard() {
     const bindings=consumptionBindings.filter(item=>item.spec?.tenantRef===tenantName && (item.spec?.consumableRef===selected || item.spec?.serviceClass===selected));
     const claims=resourceClaims.filter(item=>item.spec?.tenantRef===tenantName && (item.spec?.capability===selected || item.spec?.resourceClass===selected));
     const ownedPods=pods.filter(item=>objectOwner(item)===tenantName && String(item.status?.phase || '').toLowerCase()!=='succeeded');
+    const ownedControllers=workloads.filter(item=>objectOwner(item)===tenantName);
     const ownedPvcs=pvcs.filter(item=>objectOwner(item)===tenantName);
     const metricRows=rows.filter(item=>item.tenant===tenantName && (item.resourceType===selected || item.resource===selected || item.domain===selected));
     const podRequest=(name:string)=>ownedPods.reduce((sum,pod)=>sum+(pod.spec?.containers || []).reduce((containerSum:number,container:any)=>containerSum+quantity(container.resources?.requests?.[name]),0),0);
+    const controllerPodSpec=(item:KubeObject)=>item.kind==='CronJob'?item.spec?.jobTemplate?.spec?.template?.spec:item.kind==='Job'?item.spec?.template?.spec:item.spec?.template?.spec;
+    const controllerRequest=(name:string)=>ownedControllers.reduce((sum,item)=>{const podSpec=controllerPodSpec(item);const replicas=item.kind==='DaemonSet'?1:Math.max(1,n(item.spec?.replicas || 1));return sum+(podSpec?.containers || []).reduce((containerSum:number,container:any)=>containerSum+quantity(container.resources?.requests?.[name])*replicas,0);},0);
     const pvcBytes=ownedPvcs.reduce((sum,pvc)=>sum+quantity(pvc.status?.capacity?.storage || pvc.spec?.resources?.requests?.storage),0);
+    const templateStorage=ownedControllers.reduce((sum,item)=>sum+(item.spec?.volumeClaimTemplates || []).reduce((claimSum:number,claim:any)=>claimSum+quantity(claim.spec?.resources?.requests?.storage)*Math.max(1,n(item.spec?.replicas || 1)),0),0);
     const metered=metricRows.reduce((sum,item)=>sum+(selected==='cluster.network-egress' && item.meter!=='network_egress_byte' ? 0 : item.occupiedTime || item.occupancy),0);
-    const observed=selected==='cluster.cpu'?podRequest('cpu'):selected==='cluster.memory'?podRequest('memory'):selected==='compute.workload.v1'?ownedPods.length:selected==='storage.volume.v1'?pvcBytes:metered;
+    const livePodsAvailable=pods.length>0;
+    const livePvcsAvailable=pvcs.length>0;
+    const observed=selected==='cluster.cpu'?(livePodsAvailable?podRequest('cpu'):controllerRequest('cpu')):selected==='cluster.memory'?(livePodsAvailable?podRequest('memory'):controllerRequest('memory')):selected==='compute.workload.v1'?(livePodsAvailable?ownedPods.length:ownedControllers.length):selected==='storage.volume.v1'?(livePvcsAvailable?pvcBytes:templateStorage):metered;
     const declared=bindings.length+claims.length;
     const allocated=['cluster.cpu','cluster.memory','storage.volume.v1'].includes(selected)?observed:declared;
-    return {tenant:tenantName,allocated,observed,evidence:`${grants} grant · ${bindings.length} binding · ${claims.length} claim`};
+    const evidence=selected==='compute.workload.v1' || selected==='cluster.cpu' || selected==='cluster.memory' ? `${livePodsAvailable?'Pod':'controller template'} · ${ownedControllers.length} controllers` : selected==='storage.volume.v1' ? `${livePvcsAvailable?'PVC':'volumeClaimTemplate'} · ${ownedControllers.length} controllers` : `${grants} grant · ${bindings.length} binding · ${claims.length} claim`;
+    return {tenant:tenantName,allocated,observed,evidence};
   };
   const allocationLanes=tenants.map(name=>tenantAllocation(name,resourceClass)).filter(lane=>lane.allocated>0 || lane.observed>0 || tenantViews.find(view=>view.name===lane.tenant)?.grants.some(grant=>grant.spec?.consumableRef===resourceClass));
-  const selectedCapacity=(resourceClass==='compute.workload.v1'?clusterFacts.find(item=>item.resourceClass==='cluster.pods')?.capacity:capacityFacts.find(item=>item.resourceClass===resourceClass && item.scope==='cluster')?.capacity) ?? consumableFacts.find(item=>item.resourceClass===resourceClass)?.capacity ?? null;
+  const selectedCapacity=(resourceClass==='compute.workload.v1'?(pods.length?clusterFacts.find(item=>item.resourceClass==='cluster.pods')?.capacity:null):capacityFacts.find(item=>item.resourceClass===resourceClass && item.scope==='cluster')?.capacity) ?? consumableFacts.find(item=>item.resourceClass===resourceClass)?.capacity ?? null;
   const globalClassRows=globalResourceClasses.map(name=>{const consumable=consumables.find(item=>item.spec?.serviceClass===name || item.metadata?.name===name);const lanes=tenants.map(value=>tenantAllocation(value,name));return {name,label:classLabels[name]||name,lifecycle:String(consumable?.spec?.lifecycle || 'Undeclared'),access:String(consumable?.spec?.accessContract?.kind || consumable?.spec?.accessContract || '-'),meters:(consumable?.spec?.meters || []).map((meter:any)=>meter.name || meter).join(', ') || '-',ceiling:capacityFacts.find(item=>item.resourceClass===name)?.capacity ?? null,allocated:lanes.reduce((sum,lane)=>sum+lane.allocated,0),observed:lanes.reduce((sum,lane)=>sum+lane.observed,0)};});
   const selectedToolGroups=tenant ? TENANT_TOOL_GROUPS.filter(group=>group.resourceClass==='all service classes' || selectedGrants.some(grant=>grant.spec?.consumableRef===group.resourceClass)) : [];
   const eventOf=(item:KubeObject, stage:string, transition:string, detail:string, time?:string):FactEvent=>({id:`${stage}:${item.metadata?.uid || item.metadata?.namespace || ''}:${item.metadata?.name || ''}:${time || ''}`,time:time || item.metadata?.creationTimestamp || '',tenant:String(item.spec?.tenantRef || item.metadata?.labels?.['re8ch.com/tenant'] || '-'),trace:objectTrace(item),stage,resource:`${item.kind || stage}/${item.metadata?.namespace ? `${item.metadata.namespace}/` : ''}${item.metadata?.name || '-'}`,transition,detail:compactDetail(detail),source:item.apiVersion || 'kubernetes'});
@@ -280,8 +282,8 @@ function Dashboard() {
       <Box><Typography variant="h4">Bifurcate Facts</Typography><Typography color="text.secondary">容量、分配与 Invoke 资源流的只读事实面</Typography></Box>
       <Button variant="outlined" onClick={() => void refresh()} disabled={loading}>{loading ? '读取中…' : '刷新'}</Button>
     </Box>
-    <Alert severity={sourceErrors.length || error ? 'warning' : 'success'} sx={{mb:2}}>
-      Kubernetes 对象是事实来源；Birfucate 指标仅补充计量。{sourceErrors.length || error ? ` ${sourceErrors.length + (error ? 1 : 0)} 个采集端点暂不可用，已有事实仍会展示。` : ' 当前采集端点正常。'}
+    <Alert severity={loading ? 'info' : sourceErrors.length || error ? 'warning' : 'success'} sx={{mb:2}}>
+      Kubernetes 对象是事实来源；Birfucate 指标仅补充计量。{loading ? ' 正在等待各事实来源，当前数字不作为最终事实。' : sourceErrors.length || error ? ` ${sourceErrors.length + (error ? 1 : 0)} 个采集端点超时或不可用；未知值不会显示为容量 0。` : ' 当前采集端点正常。'}
     </Alert>
     <Box sx={{display:'flex',gap:2,flexWrap:'wrap',mb:2}}>
       <FormControl size="small" sx={{minWidth:180}}><InputLabel>Tenant</InputLabel><Select value={tenant} label="Tenant" onChange={e=>setTenant(String(e.target.value))}><MenuItem value="">全部</MenuItem>{tenants.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}</Select></FormControl>
@@ -333,7 +335,7 @@ function Dashboard() {
         {globalResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
       </Tabs>
       <Alert severity={selectedCapacity == null ? 'info' : 'success'} sx={{my:1}}>{selectedCapacity == null ? '该资源类尚未声明可出租容量上限，因此只展示已分配与已观测事实，不伪造“未分配”数量。' : `容量上限 ${human(selectedCapacity)}；未分配量由上限减去已分配量得到。`}</Alert>
-      <ResourceCorridors resourceClass={resourceClass} lanes={allocationLanes} capacity={selectedCapacity}/>
+      <ResourceCorridors resourceClass={resourceClass} unit={resourceClass==='compute.workload.v1'?(pods.length?'pods':'controllers'):capacityFacts.find(item=>item.resourceClass===resourceClass)?.unit || 'units'} lanes={allocationLanes} capacity={selectedCapacity}/>
     </SectionBox>
     <SectionBox title={`Global resource classes (${globalClassRows.length})`}>
       <Table data={globalClassRows} columns={[
