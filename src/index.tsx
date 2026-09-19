@@ -20,7 +20,7 @@ const METRICS = [
 
 type Labels = Record<string, string>;
 type Sample = { metric: Labels; value: [number, string] };
-type KubeObject = { apiVersion?: string; kind?: string; metadata?: {name?: string; namespace?: string; labels?: Labels}; spec?: Record<string, any>; status?: Record<string, any> };
+type KubeObject = { apiVersion?: string; kind?: string; metadata?: {name?: string; namespace?: string; labels?: Labels; annotations?: Labels; creationTimestamp?: string; uid?: string}; spec?: Record<string, any>; status?: Record<string, any>; eventTime?: string; lastTimestamp?: string; reason?: string; note?: string; message?: string; regarding?: {kind?:string; namespace?:string; name?:string} };
 type TenantView = {
   name: string; displayName: string; lifecycle: string; visibility: string;
   hostingMode: string; byocAllowed: boolean; runtimeNamespace: string;
@@ -34,6 +34,8 @@ type Row = {
   intensity: number; fanout: number; score: number; cost: number;
   currency: string; priced: boolean; resourceType: string; purpose: string;
 };
+type CapacityFact = {id:string; resourceClass:string; source:string; unit:string; capacity:number|null; allocated:number; used:number|null; scope:string; evidence:string};
+type FactEvent = {id:string; time:string; tenant:string; trace:string; stage:string; resource:string; transition:string; detail:string; source:string};
 
 function n(value: unknown): number {
   const parsed = Number(value);
@@ -57,6 +59,37 @@ async function instantQuery(query: string): Promise<Sample[]> {
 async function apiList(path: string): Promise<KubeObject[]> {
   const response: any = await request(path, {method: 'GET'});
   return response?.items || [];
+}
+
+async function optionalApiList(path: string): Promise<{items:KubeObject[]; error:string}> {
+  try { return {items: await apiList(path), error:''}; }
+  catch (caught) { return {items:[], error:String(caught)}; }
+}
+
+function quantity(value: unknown): number {
+  const raw=String(value ?? '').trim();
+  if (!raw) return 0;
+  const match=raw.match(/^([0-9.]+)([a-zA-Z]+)?$/);
+  if (!match) return n(raw);
+  const amount=n(match[1]); const suffix=match[2] || '';
+  const scale:Record<string,number>={m:.001,Ki:1024,Mi:1024**2,Gi:1024**3,Ti:1024**4,k:1000,M:1000**2,G:1000**3};
+  return amount*(scale[suffix] || 1);
+}
+
+function compactTime(value:string):string {
+  if (!value) return '-';
+  const date=new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function compactDetail(value:unknown):string {
+  const text=String(value ?? '').replace(/\s+/g,' ').trim();
+  return text.length > 240 ? `${text.slice(0,237)}…` : text;
+}
+
+function objectTrace(item:KubeObject):string {
+  const values={...(item.metadata?.annotations || {}),...(item.metadata?.labels || {})};
+  const keys=['re8ch.com/trace-id','trace-id','trace_id','re8ch.com/task-id','task-id','task_id','invoke-id','correlation-id'];
+  return keys.map(key=>values[key]).find(Boolean) || String(item.spec?.idempotencyKey || item.status?.claimHash || '-');
 }
 
 function key(labels: Labels): string {
@@ -100,33 +133,36 @@ function Dashboard() {
   const [serviceInstances, setServiceInstances] = useState<KubeObject[]>([]);
   const [connections, setConnections] = useState<KubeObject[]>([]);
   const [consumptionBindings, setConsumptionBindings] = useState<KubeObject[]>([]);
+  const [consumables, setConsumables] = useState<KubeObject[]>([]);
+  const [resourceClaims, setResourceClaims] = useState<KubeObject[]>([]);
+  const [resourceQuotas, setResourceQuotas] = useState<KubeObject[]>([]);
+  const [nodes, setNodes] = useState<KubeObject[]>([]);
+  const [clusterEvents, setClusterEvents] = useState<KubeObject[]>([]);
+  const [sourceErrors, setSourceErrors] = useState<string[]>([]);
+  const [traceFilter, setTraceFilter] = useState('');
 
   async function refresh() {
     setLoading(true); setError('');
     try {
-      const [results, tenantObjects, identityObjects, grantObjects, registrations, namespaces, deployments, statefulSets, daemonSets, jobs, cronJobs, nuclioFunctions, instances, clusterConnections, bindings] = await Promise.all([
-        Promise.all(METRICS.map(metric => instantQuery(metric))),
-        apiList('/apis/tenancy.re8ch.com/v1alpha1/tenants'),
-        apiList('/apis/tenancy.re8ch.com/v1alpha1/tenantidentitybindings'),
-        apiList('/apis/tenancy.re8ch.com/v1alpha1/tenantgrants'),
-        apiList('/apis/finops.re8ch.com/v1alpha1/clusterregistrations'),
-        apiList('/api/v1/namespaces'),
-        apiList('/apis/apps/v1/deployments'),
-        apiList('/apis/apps/v1/statefulsets'),
-        apiList('/apis/apps/v1/daemonsets'),
-        apiList('/apis/batch/v1/jobs'),
-        apiList('/apis/batch/v1/cronjobs'),
-        apiList('/apis/nuclio.io/v1beta1/nucliofunctions'),
-        apiList('/apis/tenancy.re8ch.com/v1alpha1/tenantserviceinstances'),
-        apiList('/apis/finops.re8ch.com/v1alpha1/clusterconnections'),
-        apiList('/apis/finops.re8ch.com/v1alpha1/consumptionbindings'),
-      ]);
+      const metricResults=await Promise.all(METRICS.map(metric=>instantQuery(metric).then(items=>({items,error:''})).catch(caught=>({items:[] as Sample[],error:String(caught)}))));
+      const results=metricResults.map(result=>result.items);
+      const paths=[
+        '/apis/tenancy.re8ch.com/v1alpha1/tenants','/apis/tenancy.re8ch.com/v1alpha1/tenantidentitybindings','/apis/tenancy.re8ch.com/v1alpha1/tenantgrants',
+        '/apis/finops.re8ch.com/v1alpha1/clusterregistrations','/api/v1/namespaces','/apis/apps/v1/deployments','/apis/apps/v1/statefulsets','/apis/apps/v1/daemonsets',
+        '/apis/batch/v1/jobs','/apis/batch/v1/cronjobs','/apis/nuclio.io/v1beta1/nucliofunctions','/apis/tenancy.re8ch.com/v1alpha1/tenantserviceinstances',
+        '/apis/finops.re8ch.com/v1alpha1/clusterconnections','/apis/finops.re8ch.com/v1alpha1/consumptionbindings','/apis/finops.re8ch.com/v1alpha1/consumables',
+        '/apis/tenancy.re8ch.com/v1alpha1/tenantresourceclaims','/api/v1/resourcequotas','/api/v1/nodes','/apis/events.k8s.io/v1/events',
+      ];
+      const kubeResults=await Promise.all(paths.map(optionalApiList));
+      const [tenantObjects, identityObjects, grantObjects, registrations, namespaces, deployments, statefulSets, daemonSets, jobs, cronJobs, nuclioFunctions, instances, clusterConnections, bindings, consumableObjects, claims, quotas, nodeObjects, events]=kubeResults.map(result=>result.items);
+      setSourceErrors([...new Set([...metricResults.map(x=>x.error),...kubeResults.map(x=>x.error)].filter(Boolean))]);
       const typedWorkloads = [
         ...deployments.map(x=>({...x,kind:'Deployment'})), ...statefulSets.map(x=>({...x,kind:'StatefulSet'})),
         ...daemonSets.map(x=>({...x,kind:'DaemonSet'})), ...jobs.map(x=>({...x,kind:'Job'})),
         ...cronJobs.map(x=>({...x,kind:'CronJob'})), ...nuclioFunctions.map(x=>({...x,kind:'NuclioFunction'})),
       ];
       setWorkloads(typedWorkloads); setServiceInstances(instances); setConnections(clusterConnections); setConsumptionBindings(bindings);
+      setConsumables(consumableObjects); setResourceClaims(claims); setResourceQuotas(quotas); setNodes(nodeObjects); setClusterEvents(events);
       setTenantViews(tenantObjects.map(item => {
         const name = item.metadata?.name || '';
         const spec = item.spec || {};
@@ -202,19 +238,77 @@ function Dashboard() {
   const resourceFlows:ResourceFlow[] = selectedGrants.map(grant=>{const resourceClass=String(grant.spec?.consumableRef||'unknown');const disposition=externalClasses.has(resourceClass)?'external':retainedClasses.has(resourceClass)?'retained':'local';const instances=visibleInstances.filter(item=>item.spec?.serviceClass===resourceClass).length;const toolCount=TENANT_TOOL_GROUPS.filter(group=>group.resourceClass===resourceClass||group.resourceClass==='all service classes').reduce((sum,group)=>sum+group.tools.length,0);const count=resourceClass==='compute.workload.v1'?visibleWorkloads.length:instances;return {id:resourceClass,label:classLabels[resourceClass]||resourceClass,resourceClass,count,toolCount,disposition,destinations:disposition==='external'?externalDestinations:[],detail:`grant Active · ${instances} service instances`};});
   if (visibleConnections.length && !resourceFlows.some(flow=>flow.id==='byoc')) resourceFlows.push({id:'byoc',label:'BYOC connections',resourceClass:'byoc.cluster',count:visibleConnections.length,toolCount:4,disposition:'external',destinations:externalDestinations,detail:'connected'});
 
+  const tenantNamespaces=new Set(visibleTenantViews.flatMap(view=>[view.runtimeNamespace,...view.businessNamespaces,...view.observedNamespaces]).filter(name=>name && name!=='-'));
+  const quotaFacts:CapacityFact[]=resourceQuotas.filter(item=>tenantNamespaces.has(item.metadata?.namespace || '')).flatMap(item=>{
+    const hard=item.status?.hard || item.spec?.hard || {}; const used=item.status?.used || {};
+    return Object.keys(hard).map(dimension=>({id:`quota:${item.metadata?.namespace}:${item.metadata?.name}:${dimension}`,resourceClass:dimension,source:'ResourceQuota',unit:dimension,capacity:quantity(hard[dimension]),allocated:quantity(hard[dimension]),used:quantity(used[dimension]),scope:item.metadata?.namespace || '-',evidence:`${item.metadata?.namespace}/${item.metadata?.name}`}));
+  });
+  const nodeCapacity=(field:string)=>nodes.reduce((sum,item)=>sum+quantity(item.status?.allocatable?.[field]),0);
+  const clusterFacts:CapacityFact[]=[
+    {id:'cluster:cpu',resourceClass:'cluster.cpu',source:'Node.status.allocatable',unit:'cores',capacity:nodeCapacity('cpu'),allocated:quotaFacts.filter(x=>x.resourceClass.includes('cpu')).reduce((sum,x)=>sum+x.allocated,0),used:null,scope:'cluster',evidence:`${nodes.length} nodes`},
+    {id:'cluster:memory',resourceClass:'cluster.memory',source:'Node.status.allocatable',unit:'bytes',capacity:nodeCapacity('memory'),allocated:quotaFacts.filter(x=>x.resourceClass.includes('memory')).reduce((sum,x)=>sum+x.allocated,0),used:null,scope:'cluster',evidence:`${nodes.length} nodes`},
+    {id:'cluster:pods',resourceClass:'cluster.pods',source:'Node.status.allocatable',unit:'pods',capacity:nodeCapacity('pods'),allocated:quotaFacts.filter(x=>x.resourceClass==='pods').reduce((sum,x)=>sum+x.allocated,0),used:visibleWorkloads.length,scope:'cluster',evidence:`${nodes.length} nodes`},
+  ];
+  const consumableFacts:CapacityFact[]=consumables.filter(item=>item.spec?.lifecycle==='Approved').map(item=>{
+    const resourceClass=String(item.spec?.serviceClass || item.metadata?.name || 'unknown');
+    const matching=visibleBindings.filter(binding=>binding.spec?.consumableRef===item.metadata?.name || binding.spec?.consumableRef===resourceClass);
+    const declared=item.status?.capacity?.limit ?? item.spec?.capacity?.limit;
+    return {id:`consumable:${item.metadata?.name}`,resourceClass,source:'Consumable + ConsumptionBinding',unit:String(item.status?.capacity?.unit || item.spec?.capacity?.unit || 'instances'),capacity:declared == null ? null : n(declared),allocated:matching.length,used:matching.filter(binding=>String(binding.status?.phase || '').toLowerCase()==='ready').length,scope:String(item.spec?.owner || 'platform'),evidence:declared == null ? '未声明出租上限' : `${item.metadata?.name}`};
+  });
+  const capacityFacts=[...clusterFacts,...consumableFacts,...quotaFacts];
+  const eventOf=(item:KubeObject, stage:string, transition:string, detail:string, time?:string):FactEvent=>({id:`${stage}:${item.metadata?.uid || item.metadata?.namespace || ''}:${item.metadata?.name || ''}:${time || ''}`,time:time || item.metadata?.creationTimestamp || '',tenant:String(item.spec?.tenantRef || item.metadata?.labels?.['re8ch.com/tenant'] || '-'),trace:objectTrace(item),stage,resource:`${item.kind || stage}/${item.metadata?.namespace ? `${item.metadata.namespace}/` : ''}${item.metadata?.name || '-'}`,transition,detail:compactDetail(detail),source:item.apiVersion || 'kubernetes'});
+  const factEvents:FactEvent[]=[
+    ...visibleTenantViews.flatMap(view=>view.grants.map(item=>eventOf({...item,kind:'TenantGrant'},'grant',String(item.spec?.lifecycle || 'Observed'),String(item.spec?.consumableRef || '-')))),
+    ...visibleInstances.map(item=>eventOf({...item,kind:'TenantServiceInstance'},'allocation',String(item.status?.phase || item.spec?.lifecycle || 'Observed'),`${item.spec?.serviceClass || '-'} · ${item.spec?.plan || '-'}`)),
+    ...visibleBindings.map(item=>eventOf({...item,kind:'ConsumptionBinding'},'binding',String(item.status?.phase || 'Bound'),`${item.spec?.consumableRef || '-'} · quota ${JSON.stringify(item.spec?.quota || {})}`,String(item.spec?.startsAt || item.metadata?.creationTimestamp || ''))),
+    ...resourceClaims.filter(item=>!tenant || item.spec?.tenantRef===tenant).map(item=>eventOf({...item,kind:'TenantResourceClaim'},'invoke',String(item.status?.phase || item.spec?.desiredState || 'Pending'),`${item.spec?.capability || '-'} · ttl ${item.spec?.ttlSeconds || '-'}s`)),
+    ...clusterEvents.filter(item=>!tenant || (item.metadata?.namespace ? tenantNamespaces.has(item.metadata.namespace) : true)).map(item=>eventOf(item,'kubernetes',String(item.reason || 'Event'),String(item.note || item.message || ''),String(item.eventTime || item.lastTimestamp || item.metadata?.creationTimestamp || ''))),
+  ].filter(item=>(!tenant || item.tenant===tenant || item.tenant==='-') && (!traceFilter || `${item.trace} ${item.resource} ${item.detail}`.toLowerCase().includes(traceFilter.toLowerCase()))).sort((a,b)=>Date.parse(b.time || '0')-Date.parse(a.time || '0')).slice(0,100);
+  const traceCount=new Set(factEvents.map(event=>event.trace).filter(value=>value && value!=='-')).size;
+
   return <Box sx={{p: 2}}>
     <Box sx={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:2,mb:1}}>
-      <Box><Typography variant="h4">Birfucate Browser</Typography><Typography color="text.secondary">租户资源占用与消费行为分叉的只读观察面</Typography></Box>
+      <Box><Typography variant="h4">Bifurcate Facts</Typography><Typography color="text.secondary">容量、分配与 Invoke 资源流的只读事实面</Typography></Box>
       <Button variant="outlined" onClick={() => void refresh()} disabled={loading}>{loading ? '读取中…' : '刷新'}</Button>
     </Box>
-    <Alert severity="info" sx={{mb:2}}>只读 showback：费用来自 Chart 中经版本管理的费率卡，仅供计量归因，不会创建账单或入账。</Alert>
-    {error && <Alert severity="error" sx={{mb:2}}>无法读取 Birfucate 指标：{error}</Alert>}
+    <Alert severity={sourceErrors.length || error ? 'warning' : 'success'} sx={{mb:2}}>
+      Kubernetes 对象是事实来源；Birfucate 指标仅补充计量。{sourceErrors.length || error ? ` ${sourceErrors.length + (error ? 1 : 0)} 个采集端点暂不可用，已有事实仍会展示。` : ' 当前采集端点正常。'}
+    </Alert>
     <Box sx={{display:'flex',gap:2,flexWrap:'wrap',mb:2}}>
       <FormControl size="small" sx={{minWidth:180}}><InputLabel>Tenant</InputLabel><Select value={tenant} label="Tenant" onChange={e=>setTenant(String(e.target.value))}><MenuItem value="">全部</MenuItem>{tenants.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}</Select></FormControl>
       <FormControl size="small" sx={{minWidth:160}}><InputLabel>Domain</InputLabel><Select value={domain} label="Domain" onChange={e=>setDomain(String(e.target.value))}><MenuItem value="">全部</MenuItem>{domains.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}</Select></FormControl>
       <TextField size="small" label="Resource contains" value={resource} onChange={e=>setResource(e.target.value)}/>
+      <TextField size="small" label="Trace / task / resource" value={traceFilter} onChange={e=>setTraceFilter(e.target.value)}/>
       <Chip label={`${resources} visible resources`}/><Chip label={`${visibleWorkloads.length} owned workloads`}/><Chip label={`${TENANT_TOOL_COUNT} Tenant tools`}/><Chip label={`${human(selectedTenantResources)} tenant resources`}/><Chip label={`${human(occupancy)} occupancy units`}/><Chip color="primary" label={`${human(score)} bifurcation score`}/><Chip color="secondary" label={`${currency} ${human(cost || selectedTenantCost)} metered cost`}/>
     </Box>
+    <Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',md:'repeat(4,1fr)'},gap:1.5,mb:2}}>
+      {[
+        ['可出租资源类',consumableFacts.length,'Approved Consumables'],
+        ['有明确上限',capacityFacts.filter(x=>x.capacity != null && x.capacity > 0).length,`${capacityFacts.filter(x=>x.capacity == null).length} 项未声明`],
+        ['当前分配',capacityFacts.reduce((sum,x)=>sum+x.allocated,0),'配额/绑定事实'],
+        ['Invoke / Trace',traceCount,`${factEvents.length} 条近期事件`],
+      ].map(([label,value,detail])=><Box key={String(label)} sx={{border:'1px solid',borderColor:'divider',borderRadius:1,p:1.5}}><Typography variant="overline" color="text.secondary">{label}</Typography><Typography variant="h5">{human(Number(value))}</Typography><Typography variant="caption" color="text.secondary">{detail}</Typography></Box>)}
+    </Box>
+    <SectionBox title={`Capacity ledger (${capacityFacts.length})`}>
+      <Table data={capacityFacts} columns={[
+        {header:'Resource / scope',accessorFn:(x:CapacityFact)=><Box><Typography variant="body2">{x.resourceClass}</Typography><Typography variant="caption" color="text.secondary">{x.scope} · {x.unit}</Typography></Box>},
+        {header:'Capacity ceiling',accessorFn:(x:CapacityFact)=>x.capacity == null ? <StatusLabel status="warning">未声明</StatusLabel> : human(x.capacity)},
+        {header:'Allocated',accessorFn:(x:CapacityFact)=>human(x.allocated)},
+        {header:'Observed used',accessorFn:(x:CapacityFact)=>x.used == null ? '-' : human(x.used)},
+        {header:'Remaining',accessorFn:(x:CapacityFact)=>x.capacity == null ? '-' : human(Math.max(0,x.capacity-x.allocated))},
+        {header:'Evidence',accessorFn:(x:CapacityFact)=><Box><Typography variant="body2">{x.source}</Typography><Typography variant="caption" color="text.secondary">{x.evidence}</Typography></Box>},
+      ] as any}/>
+    </SectionBox>
+    <SectionBox title={`Invoke and allocation events (${factEvents.length})`}>
+      <Table data={factEvents} columns={[
+        {header:'Time',accessorFn:(x:FactEvent)=><Typography variant="caption">{compactTime(x.time)}</Typography>},
+        {header:'Trace / task',accessorFn:(x:FactEvent)=><Typography variant="caption" sx={{fontFamily:'monospace'}}>{x.trace}</Typography>},
+        {header:'Stage',accessorFn:(x:FactEvent)=><Chip size="small" variant="outlined" label={x.stage}/>},
+        {header:'Resource',accessorFn:(x:FactEvent)=><Box><Typography variant="body2">{x.resource}</Typography><Typography variant="caption" color="text.secondary">tenant {x.tenant}</Typography></Box>},
+        {header:'Transition',accessorFn:(x:FactEvent)=><StatusLabel status={/failed|error|revoked/i.test(x.transition)?'error':/ready|active|bound|approved/i.test(x.transition)?'success':'info'}>{x.transition}</StatusLabel>},
+        {header:'Observed fact',accessorFn:(x:FactEvent)=><Box><Typography variant="body2">{x.detail || '-'}</Typography><Typography variant="caption" color="text.secondary">{x.source}</Typography></Box>},
+      ] as any}/>
+    </SectionBox>
     <SectionBox title={`Tenant contracts (${visibleTenantViews.length})`}>
       <Table data={visibleTenantViews} columns={[
         {header:'Tenant',accessorFn:(x:TenantView)=><Box><Typography variant="body2">{x.displayName}</Typography><Typography variant="caption" color="text.secondary">{x.name} · 业务租户</Typography></Box>},

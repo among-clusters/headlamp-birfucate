@@ -1,10 +1,19 @@
 # Birfucate Browser for Headlamp
 
-Read-only browsing of tenant resource consumption and versioned showback cost.
-The page includes a Tenant → Resource type → Purpose flow and queries the
+Read-only factual browsing of rentable capacity, tenant allocation, invoke
+events, resource consumption and versioned showback cost. The page treats
+Kubernetes objects as evidence and telemetry as optional enrichment, so a
+temporarily unavailable metric backend does not erase the facts already
+present in the control plane. It queries the
 allowlisted browser API owned by the Birfucate Chart through the Kubernetes
 Service Proxy and renders:
 
+- Capacity ledger: cluster allocatable capacity, tenant ResourceQuota hard/used
+  values, approved Consumables, active ConsumptionBindings, explicit remaining
+  capacity, and a visible "undeclared" state when a rentable ceiling is absent.
+- Invoke and allocation events: time-ordered TenantGrant,
+  TenantServiceInstance, ConsumptionBinding, TenantResourceClaim and Kubernetes
+  Event facts correlated by trace, task, invoke or idempotency identifiers.
 - Occupancy: current occupied capacity and accumulated resource-time.
 - Bifurcation: behavior occurrences, intensity, fanout and accumulated score.
 - Resource branches: meter/domain branches observed for each tenant resource.
@@ -24,8 +33,8 @@ browser never receives the VictoriaMetrics service address or arbitrary PromQL
 access.
 
 ```sh
-npm ci
-npm run tsc
-npm run build
-npm run package
+corepack pnpm install --frozen-lockfile
+corepack pnpm run tsc
+corepack pnpm run build
+corepack pnpm run package
 ```
