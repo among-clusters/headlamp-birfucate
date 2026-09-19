@@ -124,7 +124,8 @@ function Dashboard() {
   const [namespaces, setNamespaces] = useState<KubeObject[]>([]);
   const [pods, setPods] = useState<KubeObject[]>([]);
   const [pvcs, setPvcs] = useState<KubeObject[]>([]);
-  const [resourceClass, setResourceClass] = useState('compute.workload.v1');
+  const [derivedClass, setDerivedClass] = useState('cluster.memory');
+  const [requestableClass, setRequestableClass] = useState('compute.workload.v1');
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [traceFilter, setTraceFilter] = useState('');
 
@@ -240,7 +241,11 @@ function Dashboard() {
     return {id:`consumable:${item.metadata?.name}`,resourceClass,source:'Consumable + ConsumptionBinding',unit:String(item.status?.capacity?.unit || item.spec?.capacity?.unit || 'instances'),capacity:declared == null ? null : n(declared),allocated:matching.length,used:matching.filter(binding=>String(binding.status?.phase || '').toLowerCase()==='ready').length,scope:String(item.spec?.owner || 'platform'),evidence:declared == null ? '未声明出租上限' : `${item.metadata?.name}`};
   });
   const capacityFacts=[...clusterFacts,...consumableFacts,...quotaFacts];
-  const globalResourceClasses=[...new Set(['cluster.cpu','cluster.memory','compute.workload.v1','storage.volume.v1','cluster.network-egress',...consumables.map(item=>String(item.spec?.serviceClass || item.metadata?.name || '')).filter(Boolean)])];
+  // A tenant requests a Consumable (workload, sandbox, volume, database…). CPU,
+  // memory and network are consequences observed after that resource runs. Keep
+  // the two taxonomies separate so a derived signal never looks requestable.
+  const derivedResourceClasses=['cluster.cpu','cluster.memory','cluster.network-egress'];
+  const requestableResourceClasses=[...new Set(consumables.map(item=>String(item.spec?.serviceClass || item.metadata?.name || '')).filter(Boolean))];
   const tenantAllocation=(tenantName:string,selected:string):AllocationLane=>{
     const grants=tenantViews.find(view=>view.name===tenantName)?.grants.filter(item=>item.spec?.consumableRef===selected).length || 0;
     const bindings=consumptionBindings.filter(item=>item.spec?.tenantRef===tenantName && (item.spec?.consumableRef===selected || item.spec?.serviceClass===selected));
@@ -263,9 +268,11 @@ function Dashboard() {
     const evidence=selected==='compute.workload.v1' || selected==='cluster.cpu' || selected==='cluster.memory' ? `${livePodsAvailable?'Pod':'controller template'} · ${ownedControllers.length} controllers` : selected==='storage.volume.v1' ? `${livePvcsAvailable?'PVC':'volumeClaimTemplate'} · ${ownedControllers.length} controllers` : `${grants} grant · ${bindings.length} binding · ${claims.length} claim`;
     return {tenant:tenantName,allocated,observed,evidence};
   };
-  const allocationLanes=tenants.map(name=>tenantAllocation(name,resourceClass)).filter(lane=>lane.allocated>0 || lane.observed>0 || tenantViews.find(view=>view.name===lane.tenant)?.grants.some(grant=>grant.spec?.consumableRef===resourceClass));
-  const selectedCapacity=(resourceClass==='compute.workload.v1'?(pods.length?clusterFacts.find(item=>item.resourceClass==='cluster.pods')?.capacity:null):capacityFacts.find(item=>item.resourceClass===resourceClass && item.scope==='cluster')?.capacity) ?? consumableFacts.find(item=>item.resourceClass===resourceClass)?.capacity ?? null;
-  const globalClassRows=globalResourceClasses.map(name=>{const consumable=consumables.find(item=>item.spec?.serviceClass===name || item.metadata?.name===name);const lanes=tenants.map(value=>tenantAllocation(value,name));return {name,label:classLabels[name]||name,lifecycle:String(consumable?.spec?.lifecycle || 'Undeclared'),access:String(consumable?.spec?.accessContract?.kind || consumable?.spec?.accessContract || '-'),meters:(consumable?.spec?.meters || []).map((meter:any)=>meter.name || meter).join(', ') || '-',ceiling:capacityFacts.find(item=>item.resourceClass===name)?.capacity ?? null,allocated:lanes.reduce((sum,lane)=>sum+lane.allocated,0),observed:lanes.reduce((sum,lane)=>sum+lane.observed,0)};});
+  const lanesFor=(name:string)=>tenants.map(value=>tenantAllocation(value,name)).filter(lane=>lane.allocated>0 || lane.observed>0 || tenantViews.find(view=>view.name===lane.tenant)?.grants.some(grant=>grant.spec?.consumableRef===name));
+  const capacityFor=(name:string)=>(capacityFacts.find(item=>item.resourceClass===name && item.scope==='cluster')?.capacity ?? consumableFacts.find(item=>item.resourceClass===name)?.capacity ?? null);
+  const classRow=(name:string)=>{const consumable=consumables.find(item=>item.spec?.serviceClass===name || item.metadata?.name===name);const lanes=tenants.map(value=>tenantAllocation(value,name));const contract=consumable?.spec?.accessContract;return {name,label:classLabels[name]||name,lifecycle:String(consumable?.spec?.lifecycle || 'Observed'),access:typeof contract==='string'?contract:String(contract?.kind || contract?.mode || '-'),meters:(consumable?.spec?.meters || []).map((meter:any)=>meter.name || meter).join(', ') || '-',ceiling:capacityFor(name),allocated:lanes.reduce((sum,lane)=>sum+lane.allocated,0),observed:lanes.reduce((sum,lane)=>sum+lane.observed,0)};};
+  const requestableClassRows=requestableResourceClasses.map(classRow);
+  const derivedClassRows=derivedResourceClasses.map(classRow);
   const selectedToolGroups=tenant ? TENANT_TOOL_GROUPS.filter(group=>group.resourceClass==='all service classes' || selectedGrants.some(grant=>grant.spec?.consumableRef===group.resourceClass)) : [];
   const eventOf=(item:KubeObject, stage:string, transition:string, detail:string, time?:string):FactEvent=>({id:`${stage}:${item.metadata?.uid || item.metadata?.namespace || ''}:${item.metadata?.name || ''}:${time || ''}`,time:time || item.metadata?.creationTimestamp || '',tenant:String(item.spec?.tenantRef || item.metadata?.labels?.['re8ch.com/tenant'] || '-'),trace:objectTrace(item),stage,resource:`${item.kind || stage}/${item.metadata?.namespace ? `${item.metadata.namespace}/` : ''}${item.metadata?.name || '-'}`,transition,detail:compactDetail(detail),source:item.apiVersion || 'kubernetes'});
   const factEvents:FactEvent[]=[
@@ -273,6 +280,7 @@ function Dashboard() {
     ...visibleInstances.map(item=>eventOf({...item,kind:'TenantServiceInstance'},'allocation',String(item.status?.phase || item.spec?.lifecycle || 'Observed'),`${item.spec?.serviceClass || '-'} · ${item.spec?.plan || '-'}`)),
     ...visibleBindings.map(item=>eventOf({...item,kind:'ConsumptionBinding'},'binding',String(item.status?.phase || 'Bound'),`${item.spec?.consumableRef || '-'} · quota ${JSON.stringify(item.spec?.quota || {})}`,String(item.spec?.startsAt || item.metadata?.creationTimestamp || ''))),
     ...resourceClaims.filter(item=>!tenant || item.spec?.tenantRef===tenant).map(item=>eventOf({...item,kind:'TenantResourceClaim'},'invoke',String(item.status?.phase || item.spec?.desiredState || 'Pending'),`${item.spec?.capability || '-'} · ttl ${item.spec?.ttlSeconds || '-'}s`)),
+    ...visibleWorkloads.map(item=>eventOf(item,'runtime',String(item.status?.readyReplicas || item.status?.active || 0 ? 'Running' : 'Allocated'),`compute.workload.v1 → CPU/RAM/网络派生占用`,item.metadata?.creationTimestamp)),
     ...clusterEvents.filter(item=>!tenant || (item.metadata?.namespace ? tenantNamespaces.has(item.metadata.namespace) : true)).map(item=>eventOf(item,'kubernetes',String(item.reason || 'Event'),String(item.note || item.message || ''),String(item.eventTime || item.lastTimestamp || item.metadata?.creationTimestamp || ''))),
   ].filter(item=>(!tenant || item.tenant===tenant || item.tenant==='-') && (!traceFilter || `${item.trace} ${item.resource} ${item.detail}`.toLowerCase().includes(traceFilter.toLowerCase()))).sort((a,b)=>Date.parse(b.time || '0')-Date.parse(a.time || '0')).slice(0,100);
   const traceCount=new Set(factEvents.map(event=>event.trace).filter(value=>value && value!=='-')).size;
@@ -310,7 +318,8 @@ function Dashboard() {
         {header:'Evidence',accessorFn:(x:CapacityFact)=><Box><Typography variant="body2">{x.source}</Typography><Typography variant="caption" color="text.secondary">{x.evidence}</Typography></Box>},
       ] as any}/>
     </SectionBox>
-    <SectionBox title={`Invoke and allocation events (${factEvents.length})`}>
+    <SectionBox title={`租户资源转换轨迹 (${factEvents.length})`}>
+      <Alert severity="info" sx={{mb:1}}>按 Tenant 与 Trace / task 筛选：申请（invoke）→ 绑定/分配 → runtime 派生占用 → Kubernetes 释放事件。轨迹只陈述已观测事实；Watch 断流期间缺失的释放事件会标记为数据源不可用，不反推为“仍占用”。</Alert>
       <Table data={factEvents} columns={[
         {header:'Time',accessorFn:(x:FactEvent)=><Typography variant="caption">{compactTime(x.time)}</Typography>},
         {header:'Trace / task',accessorFn:(x:FactEvent)=><Typography variant="caption" sx={{fontFamily:'monospace'}}>{x.trace}</Typography>},
@@ -330,20 +339,37 @@ function Dashboard() {
         {header:'Granted capabilities',accessorFn:(x:TenantView)=><Box>{x.grants.map(grant=><Chip key={grant.metadata?.name} size="small" label={grant.spec?.consumableRef} sx={{mr:.5,mb:.5}}/>)}</Box>},
       ] as any}/>
     </SectionBox>
-    <SectionBox title="Global resource allocation">
-      <Tabs value={resourceClass} onChange={(_event,value)=>setResourceClass(value)} variant="scrollable" scrollButtons="auto" aria-label="Resource type">
-        {globalResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
+    <SectionBox title="租户可申请资源（Consumables）">
+      <Alert severity="info" sx={{mb:1}}>租户只能申请这里的资源类。Workload、Sandbox 等获批并运行后，才会派生 CPU、内存和网络占用。</Alert>
+      <Tabs value={requestableClass} onChange={(_event,value)=>setRequestableClass(value)} variant="scrollable" scrollButtons="auto" aria-label="Requestable resource type">
+        {requestableResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
       </Tabs>
-      <Alert severity={selectedCapacity == null ? 'info' : 'success'} sx={{my:1}}>{selectedCapacity == null ? '该资源类尚未声明可出租容量上限，因此只展示已分配与已观测事实，不伪造“未分配”数量。' : `容量上限 ${human(selectedCapacity)}；未分配量由上限减去已分配量得到。`}</Alert>
-      <ResourceCorridors resourceClass={resourceClass} unit={resourceClass==='compute.workload.v1'?(pods.length?'pods':'controllers'):capacityFacts.find(item=>item.resourceClass===resourceClass)?.unit || 'units'} lanes={allocationLanes} capacity={selectedCapacity}/>
+      <Alert severity={capacityFor(requestableClass) == null ? 'warning' : 'success'} sx={{my:1}}>{capacityFor(requestableClass) == null ? '该 Consumable 尚未声明可出租容量上限；只展示申请、绑定和运行事实。' : `可出租上限 ${human(Number(capacityFor(requestableClass)))}。`}</Alert>
+      <ResourceCorridors resourceClass={requestableClass} unit={requestableClass==='compute.workload.v1'?(pods.length?'pods':'controllers'):capacityFacts.find(item=>item.resourceClass===requestableClass)?.unit || 'instances'} lanes={lanesFor(requestableClass)} capacity={capacityFor(requestableClass)}/>
     </SectionBox>
-    <SectionBox title={`Global resource classes (${globalClassRows.length})`}>
-      <Table data={globalClassRows} columns={[
+    <SectionBox title="派生资源占用（不可直接申请）">
+      <Alert severity="info" sx={{mb:1}}>CPU、内存和网络不是租户申请对象；这里按 Workload / Sandbox 的实际运行规格与计量，将派生占用归属到租户。</Alert>
+      <Tabs value={derivedClass} onChange={(_event,value)=>setDerivedClass(value)} variant="scrollable" scrollButtons="auto" aria-label="Derived resource type">
+        {derivedResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
+      </Tabs>
+      <Alert severity={capacityFor(derivedClass) == null ? 'warning' : 'success'} sx={{my:1}}>{capacityFor(derivedClass) == null ? '该派生资源的总量或计量来源不可读；未知不会显示成 0。' : `集群可用总量 ${human(Number(capacityFor(derivedClass)))}；未分配量由总量减去租户派生占用得到。`}</Alert>
+      <ResourceCorridors resourceClass={derivedClass} unit={capacityFacts.find(item=>item.resourceClass===derivedClass)?.unit || 'units'} lanes={lanesFor(derivedClass)} capacity={capacityFor(derivedClass)}/>
+    </SectionBox>
+    <SectionBox title={`可申请资源目录 (${requestableClassRows.length})`}>
+      <Table data={requestableClassRows} columns={[
         {header:'Resource class',accessorFn:(x:any)=><Box><Typography variant="body2">{x.label}</Typography><Typography variant="caption" color="text.secondary">{x.name}</Typography></Box>},
         {header:'Lifecycle / access',accessorFn:(x:any)=><Box><StatusLabel status={x.lifecycle==='Approved'?'success':'warning'}>{x.lifecycle}</StatusLabel><Typography variant="caption" display="block" color="text.secondary">{x.access}</Typography></Box>},
         {header:'Capacity ceiling',accessorFn:(x:any)=>x.ceiling == null ? <StatusLabel status="warning">未声明</StatusLabel> : human(x.ceiling)},
         {header:'Allocated / observed',accessorFn:(x:any)=>`${human(x.allocated)} / ${human(x.observed)}`},
         {header:'Meters',accessorFn:(x:any)=>x.meters},
+      ] as any}/>
+    </SectionBox>
+    <SectionBox title={`派生资源事实 (${derivedClassRows.length})`}>
+      <Table data={derivedClassRows} columns={[
+        {header:'Derived resource',accessorFn:(x:any)=><Box><Typography variant="body2">{x.label}</Typography><Typography variant="caption" color="text.secondary">{x.name} · 不可直接申请</Typography></Box>},
+        {header:'Cluster ceiling',accessorFn:(x:any)=>x.ceiling == null ? <StatusLabel status="warning">未知</StatusLabel> : human(x.ceiling)},
+        {header:'Tenant-attributed / observed',accessorFn:(x:any)=>`${human(x.allocated)} / ${human(x.observed)}`},
+        {header:'Evidence',accessorFn:(x:any)=>x.meters==='-'?'Pod/controller requests':x.meters},
       ] as any}/>
     </SectionBox>
     {tenant&&<SectionBox title={`${tenant} Tenant API capabilities (${selectedToolGroups.reduce((sum,group)=>sum+group.tools.length,0)})`}>
