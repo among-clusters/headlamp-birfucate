@@ -3,6 +3,7 @@ import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { SectionBox, StatusLabel, Table } from '@kinvolk/headlamp-plugin/lib/components/common';
 import { Alert, Box, Button, Chip, FormControl, InputLabel, MenuItem, Select, Tab, Tabs, TextField, Typography } from '@mui/material';
 import React, { useEffect, useMemo, useState } from 'react';
+import { AllocationLane, ResourceCorridors } from './ResourceCorridors';
 import { TENANT_TOOL_GROUPS, ToolGroup } from './tenant-tool-catalog';
 
 const BIRFUCATE_PROXY = '/api/v1/namespaces/observability-ai/services/http:birfucate-metering:9791/proxy';
@@ -27,7 +28,6 @@ type TenantView = {
   businessNamespaces: string[]; observedNamespaces: string[];
   identities: KubeObject[]; grants: KubeObject[]; registrations: KubeObject[];
 };
-type AllocationLane = {tenant:string; allocated:number; observed:number; evidence:string};
 type Row = {
   tenant: string; resource: string; domain: string; meter: string;
   occupancy: number; occupiedTime: number; occurrences: number;
@@ -94,18 +94,6 @@ function objectTrace(item:KubeObject):string {
 
 function key(labels: Labels): string {
   return [labels.tenant || '', labels.resource_ref || '', labels.domain || '', labels.meter || ''].join('\u0000');
-}
-
-function ResourceCorridors({resourceClass, lanes, capacity}: {resourceClass:string; lanes:AllocationLane[]; capacity:number|null}) {
-  const allocated=lanes.reduce((sum,lane)=>sum+lane.allocated,0);
-  const remainder=capacity == null ? null : Math.max(0,capacity-allocated);
-  const display=[...lanes,...(remainder == null ? [] : [{tenant:'未分配',allocated:remainder,observed:0,evidence:'容量上限 − 已分配'}])];
-  const height=Math.max(190,display.length*62+55); const max=Math.max(...display.map(x=>x.allocated),1);
-  return <Box sx={{overflowX:'auto'}}><svg role="img" aria-label={`${resourceClass} allocation corridors`} viewBox={`0 0 960 ${height}`} style={{minWidth:760,width:'100%',height}}>
-    <rect x="24" y={height/2-38} width="190" height="76" rx="12" fill="#263238"/><text x="119" y={height/2-8} textAnchor="middle" fill="white" fontSize="16" fontWeight="700">{resourceClass}</text><text x="119" y={height/2+17} textAnchor="middle" fill="white" fontSize="12">{capacity == null ? '可出租上限未声明' : `总量 ${human(capacity)}`}</text>
-    {display.map((lane,index)=>{const y=48+index*62;const width=3+Math.min(25,(lane.allocated/max)*22);const color=lane.tenant==='未分配'?'#90a4ae':'#5c6bc0';return <g key={lane.tenant}><path d={`M 214 ${height/2} C 350 ${height/2}, 430 ${y}, 600 ${y}`} fill="none" stroke={color} strokeWidth={width} opacity=".78"/><rect x="600" y={y-23} width="330" height="46" rx="8" fill={color} opacity={lane.tenant==='未分配'?'.35':'.9'}/><text x="618" y={y-4} fill="white" fontSize="14" fontWeight="700">{lane.tenant}</text><text x="618" y={y+14} fill="white" fontSize="11">分配 {human(lane.allocated)} · 观测 {human(lane.observed)} · {lane.evidence}</text></g>})}
-    {!display.length&&<text x="600" y={height/2} fill="currentColor">尚无租户分配事实；容量上限也未声明</text>}
-  </svg></Box>;
 }
 
 function Dashboard() {
@@ -333,7 +321,7 @@ function Dashboard() {
         {globalResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
       </Tabs>
       <Alert severity={selectedCapacity == null ? 'info' : 'success'} sx={{my:1}}>{selectedCapacity == null ? '该资源类尚未声明可出租容量上限，因此只展示已分配与已观测事实，不伪造“未分配”数量。' : `容量上限 ${human(selectedCapacity)}；未分配量由上限减去已分配量得到。`}</Alert>
-      <ResourceCorridors resourceClass={resourceClass} lanes={allocationLanes} capacity={selectedCapacity}/>
+      <ResourceCorridors resourceClass={resourceClass} unit={capacityFacts.find(item=>item.resourceClass===resourceClass)?.unit || (resourceClass==='compute.workload.v1'?'pods':'units')} lanes={allocationLanes} capacity={selectedCapacity}/>
     </SectionBox>
     <SectionBox title={`Global resource classes (${globalClassRows.length})`}>
       <Table data={globalClassRows} columns={[
