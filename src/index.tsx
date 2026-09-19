@@ -1,9 +1,9 @@
 import { registerRoute, registerSidebarEntry } from '@kinvolk/headlamp-plugin/lib';
 import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { SectionBox, StatusLabel, Table } from '@kinvolk/headlamp-plugin/lib/components/common';
-import { Alert, Box, Button, Chip, FormControl, InputLabel, MenuItem, Select, TextField, Typography } from '@mui/material';
+import { Alert, Box, Button, Chip, FormControl, InputLabel, MenuItem, Select, Tab, Tabs, TextField, Typography } from '@mui/material';
 import React, { useEffect, useMemo, useState } from 'react';
-import { TENANT_TOOL_COUNT, TENANT_TOOL_GROUPS, ToolGroup } from './tenant-tool-catalog';
+import { TENANT_TOOL_GROUPS, ToolGroup } from './tenant-tool-catalog';
 
 const BIRFUCATE_PROXY = '/api/v1/namespaces/observability-ai/services/http:birfucate-metering:9791/proxy';
 const METRICS = [
@@ -27,7 +27,7 @@ type TenantView = {
   businessNamespaces: string[]; observedNamespaces: string[];
   identities: KubeObject[]; grants: KubeObject[]; registrations: KubeObject[];
 };
-type ResourceFlow = {id:string; label:string; resourceClass:string; count:number; toolCount:number; disposition:'retained'|'local'|'external'; destinations:string[]; detail:string};
+type AllocationLane = {tenant:string; allocated:number; observed:number; evidence:string};
 type Row = {
   tenant: string; resource: string; domain: string; meter: string;
   occupancy: number; occupiedTime: number; occurrences: number;
@@ -96,34 +96,23 @@ function key(labels: Labels): string {
   return [labels.tenant || '', labels.resource_ref || '', labels.domain || '', labels.meter || ''].join('\u0000');
 }
 
-function ResourceRing({tenant, flows}: {tenant:string; flows:ResourceFlow[]}) {
-  const colors = {retained:'#2e7d32',local:'#5c6bc0',external:'#ef6c00'};
-  const labels = {retained:'储蓄 / 回流',local:'本租户消耗',external:'外部租户分流'};
-  const cx=450, cy=270, radius=185;
-  return <Box sx={{overflowX:'auto'}}>
-    <Box sx={{display:'flex',gap:1,flexWrap:'wrap',mb:1}}>{Object.entries(labels).map(([key,label])=><Chip key={key} size="small" label={label} sx={{borderColor:colors[key as keyof typeof colors],borderWidth:2,borderStyle:'solid'}}/>)}</Box>
-    <svg role="img" aria-label="Tenant circular resource bifurcation flow" viewBox="0 0 900 540" style={{minWidth:760,width:'100%',height:540}}>
-      <defs>{Object.entries(colors).map(([key,color])=><marker key={key} id={`arrow-${key}`} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill={color}/></marker>)}</defs>
-      <circle cx={cx} cy={cy} r="82" fill="#263238" opacity=".94"/><circle cx={cx} cy={cy} r="104" fill="none" stroke="#90a4ae" strokeWidth="2" strokeDasharray="5 6"/>
-      <text x={cx} y={cy-8} textAnchor="middle" fill="white" fontSize="22" fontWeight="700">{tenant || 'all tenants'}</text><text x={cx} y={cy+20} textAnchor="middle" fill="white" fontSize="13">Tenant resource pool</text>
-      {flows.map((flow,index)=>{const angle=-Math.PI/2+index*(Math.PI*2/Math.max(flows.length,1));const x=cx+Math.cos(angle)*radius,y=cy+Math.sin(angle)*radius;const ox=cx+Math.cos(angle)*(radius+86),oy=cy+Math.sin(angle)*(radius+86);const color=colors[flow.disposition];const anchor=x<cx-20?'end':x>cx+20?'start':'middle';const tx=x+(anchor==='end'?-34:anchor==='start'?34:0);const ty=y+(y<cy?-30:42);return <g key={flow.id}>
-        <path d={`M ${cx+Math.cos(angle)*105} ${cy+Math.sin(angle)*105} Q ${cx+Math.cos(angle+.25)*145} ${cy+Math.sin(angle+.25)*145} ${x} ${y}`} fill="none" stroke={color} strokeWidth={3+Math.min(flow.count,9)} opacity=".72" markerEnd={`url(#arrow-${flow.disposition})`}/>
-        {flow.disposition==='retained'&&<path d={`M ${x} ${y} Q ${cx+Math.cos(angle-.55)*155} ${cy+Math.sin(angle-.55)*155} ${cx+Math.cos(angle-.2)*105} ${cy+Math.sin(angle-.2)*105}`} fill="none" stroke={color} strokeWidth="3" strokeDasharray="7 5" markerEnd="url(#arrow-retained)"/>}
-        {flow.disposition==='external'&&<path d={`M ${x} ${y} L ${ox} ${oy}`} fill="none" stroke={color} strokeWidth="3" strokeDasharray="8 5" markerEnd="url(#arrow-external)"/>}
-        <circle cx={x} cy={y} r="29" fill={color}/><text x={x} y={y-2} textAnchor="middle" fill="white" fontSize="13" fontWeight="700">{flow.count} res</text><text x={x} y={y+13} textAnchor="middle" fill="white" fontSize="9">{flow.toolCount} tools</text>
-        <text x={tx} y={ty} textAnchor={anchor} fill="currentColor" fontSize="13" fontWeight="700">{flow.label}</text><text x={tx} y={ty+17} textAnchor={anchor} fill="currentColor" fontSize="11">{labels[flow.disposition]}</text>
-        {flow.disposition==='external'&&<text x={ox} y={oy+(oy<cy?-9:16)} textAnchor={ox<cx?'end':'start'} fill={color} fontSize="11">{flow.destinations.join(' / ')||'external'}</text>}
-      </g>})}
-      {!flows.length&&<text x={cx} y={cy+145} textAnchor="middle" fill="currentColor">暂无已授权或已发现的资源流</text>}
-    </svg>
-  </Box>;
+function ResourceCorridors({resourceClass, lanes, capacity}: {resourceClass:string; lanes:AllocationLane[]; capacity:number|null}) {
+  const allocated=lanes.reduce((sum,lane)=>sum+lane.allocated,0);
+  const remainder=capacity == null ? null : Math.max(0,capacity-allocated);
+  const display=[...lanes,...(remainder == null ? [] : [{tenant:'未分配',allocated:remainder,observed:0,evidence:'容量上限 − 已分配'}])];
+  const height=Math.max(190,display.length*62+55); const max=Math.max(...display.map(x=>x.allocated),1);
+  return <Box sx={{overflowX:'auto'}}><svg role="img" aria-label={`${resourceClass} allocation corridors`} viewBox={`0 0 960 ${height}`} style={{minWidth:760,width:'100%',height}}>
+    <rect x="24" y={height/2-38} width="190" height="76" rx="12" fill="#263238"/><text x="119" y={height/2-8} textAnchor="middle" fill="white" fontSize="16" fontWeight="700">{resourceClass}</text><text x="119" y={height/2+17} textAnchor="middle" fill="white" fontSize="12">{capacity == null ? '可出租上限未声明' : `总量 ${human(capacity)}`}</text>
+    {display.map((lane,index)=>{const y=48+index*62;const width=3+Math.min(25,(lane.allocated/max)*22);const color=lane.tenant==='未分配'?'#90a4ae':'#5c6bc0';return <g key={lane.tenant}><path d={`M 214 ${height/2} C 350 ${height/2}, 430 ${y}, 600 ${y}`} fill="none" stroke={color} strokeWidth={width} opacity=".78"/><rect x="600" y={y-23} width="330" height="46" rx="8" fill={color} opacity={lane.tenant==='未分配'?'.35':'.9'}/><text x="618" y={y-4} fill="white" fontSize="14" fontWeight="700">{lane.tenant}</text><text x="618" y={y+14} fill="white" fontSize="11">分配 {human(lane.allocated)} · 观测 {human(lane.observed)} · {lane.evidence}</text></g>})}
+    {!display.length&&<text x="600" y={height/2} fill="currentColor">尚无租户分配事实；容量上限也未声明</text>}
+  </svg></Box>;
 }
 
 function Dashboard() {
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [tenant, setTenant] = useState('re8ch');
+  const [tenant, setTenant] = useState('');
   const [domain, setDomain] = useState('');
   const [resource, setResource] = useState('');
   const [tenantCosts, setTenantCosts] = useState<Sample[]>([]);
@@ -131,13 +120,16 @@ function Dashboard() {
   const [tenantViews, setTenantViews] = useState<TenantView[]>([]);
   const [workloads, setWorkloads] = useState<KubeObject[]>([]);
   const [serviceInstances, setServiceInstances] = useState<KubeObject[]>([]);
-  const [connections, setConnections] = useState<KubeObject[]>([]);
   const [consumptionBindings, setConsumptionBindings] = useState<KubeObject[]>([]);
   const [consumables, setConsumables] = useState<KubeObject[]>([]);
   const [resourceClaims, setResourceClaims] = useState<KubeObject[]>([]);
   const [resourceQuotas, setResourceQuotas] = useState<KubeObject[]>([]);
   const [nodes, setNodes] = useState<KubeObject[]>([]);
   const [clusterEvents, setClusterEvents] = useState<KubeObject[]>([]);
+  const [namespaces, setNamespaces] = useState<KubeObject[]>([]);
+  const [pods, setPods] = useState<KubeObject[]>([]);
+  const [pvcs, setPvcs] = useState<KubeObject[]>([]);
+  const [resourceClass, setResourceClass] = useState('compute.workload.v1');
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [traceFilter, setTraceFilter] = useState('');
 
@@ -151,18 +143,18 @@ function Dashboard() {
         '/apis/finops.re8ch.com/v1alpha1/clusterregistrations','/api/v1/namespaces','/apis/apps/v1/deployments','/apis/apps/v1/statefulsets','/apis/apps/v1/daemonsets',
         '/apis/batch/v1/jobs','/apis/batch/v1/cronjobs','/apis/nuclio.io/v1beta1/nucliofunctions','/apis/tenancy.re8ch.com/v1alpha1/tenantserviceinstances',
         '/apis/finops.re8ch.com/v1alpha1/clusterconnections','/apis/finops.re8ch.com/v1alpha1/consumptionbindings','/apis/finops.re8ch.com/v1alpha1/consumables',
-        '/apis/tenancy.re8ch.com/v1alpha1/tenantresourceclaims','/api/v1/resourcequotas','/api/v1/nodes','/apis/events.k8s.io/v1/events',
+        '/apis/tenancy.re8ch.com/v1alpha1/tenantresourceclaims','/api/v1/resourcequotas','/api/v1/nodes','/apis/events.k8s.io/v1/events','/api/v1/pods','/api/v1/persistentvolumeclaims',
       ];
       const kubeResults=await Promise.all(paths.map(optionalApiList));
-      const [tenantObjects, identityObjects, grantObjects, registrations, namespaces, deployments, statefulSets, daemonSets, jobs, cronJobs, nuclioFunctions, instances, clusterConnections, bindings, consumableObjects, claims, quotas, nodeObjects, events]=kubeResults.map(result=>result.items);
+      const [tenantObjects, identityObjects, grantObjects, registrations, namespaceObjects, deployments, statefulSets, daemonSets, jobs, cronJobs, nuclioFunctions, instances, clusterConnections, bindings, consumableObjects, claims, quotas, nodeObjects, events, podObjects, pvcObjects]=kubeResults.map(result=>result.items);
       setSourceErrors([...new Set([...metricResults.map(x=>x.error),...kubeResults.map(x=>x.error)].filter(Boolean))]);
       const typedWorkloads = [
         ...deployments.map(x=>({...x,kind:'Deployment'})), ...statefulSets.map(x=>({...x,kind:'StatefulSet'})),
         ...daemonSets.map(x=>({...x,kind:'DaemonSet'})), ...jobs.map(x=>({...x,kind:'Job'})),
         ...cronJobs.map(x=>({...x,kind:'CronJob'})), ...nuclioFunctions.map(x=>({...x,kind:'NuclioFunction'})),
       ];
-      setWorkloads(typedWorkloads); setServiceInstances(instances); setConnections(clusterConnections); setConsumptionBindings(bindings);
-      setConsumables(consumableObjects); setResourceClaims(claims); setResourceQuotas(quotas); setNodes(nodeObjects); setClusterEvents(events);
+      setWorkloads(typedWorkloads); setServiceInstances(instances); setConsumptionBindings(bindings);
+      setConsumables(consumableObjects); setResourceClaims(claims); setResourceQuotas(quotas); setNodes(nodeObjects); setClusterEvents(events); setNamespaces(namespaceObjects); setPods(podObjects); setPvcs(pvcObjects);
       setTenantViews(tenantObjects.map(item => {
         const name = item.metadata?.name || '';
         const spec = item.spec || {};
@@ -175,7 +167,7 @@ function Dashboard() {
           byocAllowed: spec.byocAllowed === true,
           runtimeNamespace: spec.runtimeNamespaceRef || '-',
           businessNamespaces: spec.businessNamespaces || [],
-          observedNamespaces: namespaces.filter(namespace => namespace.metadata?.labels?.['saas.re8ch.com/tenant'] === name).map(namespace => namespace.metadata?.name || '').filter(Boolean),
+          observedNamespaces: namespaceObjects.filter(namespace => Object.values(namespace.metadata?.labels || {}).includes(name) && Object.keys(namespace.metadata?.labels || {}).some(key=>key.includes('tenant'))).map(namespace => namespace.metadata?.name || '').filter(Boolean),
           identities: identityObjects.filter(binding => binding.spec?.tenantRef === name),
           grants: grantObjects.filter(grant => grant.spec?.tenantRef === name),
           registrations: registrations.filter(registration => registration.spec?.tenantRef === name),
@@ -215,28 +207,25 @@ function Dashboard() {
   const selectedTenantResources = tenantResources.filter(x=>!tenant || x.metric.tenant===tenant).reduce((sum,x)=>sum+n(x.value?.[1]),0);
   const currency = visible.find(x=>x.currency)?.currency || tenantCosts[0]?.metric.currency || 'CNY';
   const visibleTenantViews = tenantViews.filter(x => !tenant || x.name === tenant);
-  const namespaceOwners = new Map(tenantViews.flatMap(view=>view.businessNamespaces.map(namespace=>[namespace,view.name] as [string,string])));
+  const tenantLabelKeys=['saas.re8ch.com/tenant','re8ch.com/tenant','tenancy.re8ch.com/tenant','app.kubernetes.io/tenant'];
+  const namespaceOwners = new Map<string,string>();
+  tenantViews.forEach(view=>[view.runtimeNamespace,...view.businessNamespaces,...view.observedNamespaces].filter(name=>name && name!=='-').forEach(name=>namespaceOwners.set(name,view.name)));
+  namespaces.forEach(item=>{const owner=tenantLabelKeys.map(key=>item.metadata?.labels?.[key] || item.metadata?.annotations?.[key]).find(Boolean);if(owner&&item.metadata?.name)namespaceOwners.set(item.metadata.name,owner);});
+  resourceClaims.forEach(item=>{const owner=String(item.spec?.tenantRef || '');const runtime=String(item.status?.runtimeNamespace || item.status?.runtimeNamespaceRef || item.status?.workloadRef?.namespace || '');if(owner&&runtime)namespaceOwners.set(runtime,owner);});
+  const objectOwner=(item:KubeObject)=>tenantLabelKeys.map(key=>item.metadata?.labels?.[key] || item.metadata?.annotations?.[key]).find(Boolean) || namespaceOwners.get(item.metadata?.namespace || '') || '';
   const visibleWorkloads = workloads.filter(item => {
-    const owner=namespaceOwners.get(item.metadata?.namespace || '');
+    const owner=objectOwner(item);
     return owner && (!tenant || owner===tenant);
   });
   const visibleInstances = serviceInstances.filter(item=>!tenant || item.spec?.tenantRef===tenant);
   const visibleBindings = consumptionBindings.filter(item=>!tenant || item.spec?.tenantRef===tenant);
-  const visibleConnections = connections.filter(item=>!tenant || item.spec?.tenantRef===tenant);
-  const externalDestinations = [...new Set([
-    ...visibleBindings.flatMap(item=>item.spec?.access?.cilium?.destinationClusters || []),
-    ...visibleConnections.map(item=>item.spec?.clusterUID).filter(Boolean),
-  ])];
   const classLabels:Record<string,string> = {
+    'cluster.cpu':'CPU requests','cluster.memory':'Memory requests','cluster.network-egress':'Network egress',
     'compute.workload.v1':'Workloads','storage.volume.v1':'Volumes','database.postgresql.shared.v1':'PostgreSQL',
     'network.tenant.v1':'Tenant network','network.among-clusters.v1':'AmongClusters','observability.grafana.v1':'Grafana',
     'registry.harbor.v1':'Harbor registry','storage.bucket.v1':'Object storage','ai.model-gateway.v1':'Model gateway','sandbox.runtime.v1':'Sandbox',
   };
-  const retainedClasses=new Set(['storage.volume.v1','storage.bucket.v1','database.postgresql.shared.v1','registry.harbor.v1']);
-  const externalClasses=new Set(['network.among-clusters.v1']);
   const selectedGrants=visibleTenantViews.flatMap(view=>view.grants);
-  const resourceFlows:ResourceFlow[] = selectedGrants.map(grant=>{const resourceClass=String(grant.spec?.consumableRef||'unknown');const disposition=externalClasses.has(resourceClass)?'external':retainedClasses.has(resourceClass)?'retained':'local';const instances=visibleInstances.filter(item=>item.spec?.serviceClass===resourceClass).length;const toolCount=TENANT_TOOL_GROUPS.filter(group=>group.resourceClass===resourceClass||group.resourceClass==='all service classes').reduce((sum,group)=>sum+group.tools.length,0);const count=resourceClass==='compute.workload.v1'?visibleWorkloads.length:instances;return {id:resourceClass,label:classLabels[resourceClass]||resourceClass,resourceClass,count,toolCount,disposition,destinations:disposition==='external'?externalDestinations:[],detail:`grant Active · ${instances} service instances`};});
-  if (visibleConnections.length && !resourceFlows.some(flow=>flow.id==='byoc')) resourceFlows.push({id:'byoc',label:'BYOC connections',resourceClass:'byoc.cluster',count:visibleConnections.length,toolCount:4,disposition:'external',destinations:externalDestinations,detail:'connected'});
 
   const tenantNamespaces=new Set(visibleTenantViews.flatMap(view=>[view.runtimeNamespace,...view.businessNamespaces,...view.observedNamespaces]).filter(name=>name && name!=='-'));
   const quotaFacts:CapacityFact[]=resourceQuotas.filter(item=>tenantNamespaces.has(item.metadata?.namespace || '')).flatMap(item=>{
@@ -256,6 +245,26 @@ function Dashboard() {
     return {id:`consumable:${item.metadata?.name}`,resourceClass,source:'Consumable + ConsumptionBinding',unit:String(item.status?.capacity?.unit || item.spec?.capacity?.unit || 'instances'),capacity:declared == null ? null : n(declared),allocated:matching.length,used:matching.filter(binding=>String(binding.status?.phase || '').toLowerCase()==='ready').length,scope:String(item.spec?.owner || 'platform'),evidence:declared == null ? '未声明出租上限' : `${item.metadata?.name}`};
   });
   const capacityFacts=[...clusterFacts,...consumableFacts,...quotaFacts];
+  const globalResourceClasses=[...new Set(['cluster.cpu','cluster.memory','compute.workload.v1','storage.volume.v1','cluster.network-egress',...consumables.map(item=>String(item.spec?.serviceClass || item.metadata?.name || '')).filter(Boolean)])];
+  const tenantAllocation=(tenantName:string,selected:string):AllocationLane=>{
+    const grants=tenantViews.find(view=>view.name===tenantName)?.grants.filter(item=>item.spec?.consumableRef===selected).length || 0;
+    const bindings=consumptionBindings.filter(item=>item.spec?.tenantRef===tenantName && (item.spec?.consumableRef===selected || item.spec?.serviceClass===selected));
+    const claims=resourceClaims.filter(item=>item.spec?.tenantRef===tenantName && (item.spec?.capability===selected || item.spec?.resourceClass===selected));
+    const ownedPods=pods.filter(item=>objectOwner(item)===tenantName && String(item.status?.phase || '').toLowerCase()!=='succeeded');
+    const ownedPvcs=pvcs.filter(item=>objectOwner(item)===tenantName);
+    const metricRows=rows.filter(item=>item.tenant===tenantName && (item.resourceType===selected || item.resource===selected || item.domain===selected));
+    const podRequest=(name:string)=>ownedPods.reduce((sum,pod)=>sum+(pod.spec?.containers || []).reduce((containerSum:number,container:any)=>containerSum+quantity(container.resources?.requests?.[name]),0),0);
+    const pvcBytes=ownedPvcs.reduce((sum,pvc)=>sum+quantity(pvc.status?.capacity?.storage || pvc.spec?.resources?.requests?.storage),0);
+    const metered=metricRows.reduce((sum,item)=>sum+(selected==='cluster.network-egress' && item.meter!=='network_egress_byte' ? 0 : item.occupiedTime || item.occupancy),0);
+    const observed=selected==='cluster.cpu'?podRequest('cpu'):selected==='cluster.memory'?podRequest('memory'):selected==='compute.workload.v1'?ownedPods.length:selected==='storage.volume.v1'?pvcBytes:metered;
+    const declared=bindings.length+claims.length;
+    const allocated=['cluster.cpu','cluster.memory','storage.volume.v1'].includes(selected)?observed:declared;
+    return {tenant:tenantName,allocated,observed,evidence:`${grants} grant · ${bindings.length} binding · ${claims.length} claim`};
+  };
+  const allocationLanes=tenants.map(name=>tenantAllocation(name,resourceClass)).filter(lane=>lane.allocated>0 || lane.observed>0 || tenantViews.find(view=>view.name===lane.tenant)?.grants.some(grant=>grant.spec?.consumableRef===resourceClass));
+  const selectedCapacity=(resourceClass==='compute.workload.v1'?clusterFacts.find(item=>item.resourceClass==='cluster.pods')?.capacity:capacityFacts.find(item=>item.resourceClass===resourceClass && item.scope==='cluster')?.capacity) ?? consumableFacts.find(item=>item.resourceClass===resourceClass)?.capacity ?? null;
+  const globalClassRows=globalResourceClasses.map(name=>{const consumable=consumables.find(item=>item.spec?.serviceClass===name || item.metadata?.name===name);const lanes=tenants.map(value=>tenantAllocation(value,name));return {name,label:classLabels[name]||name,lifecycle:String(consumable?.spec?.lifecycle || 'Undeclared'),access:String(consumable?.spec?.accessContract?.kind || consumable?.spec?.accessContract || '-'),meters:(consumable?.spec?.meters || []).map((meter:any)=>meter.name || meter).join(', ') || '-',ceiling:capacityFacts.find(item=>item.resourceClass===name)?.capacity ?? null,allocated:lanes.reduce((sum,lane)=>sum+lane.allocated,0),observed:lanes.reduce((sum,lane)=>sum+lane.observed,0)};});
+  const selectedToolGroups=tenant ? TENANT_TOOL_GROUPS.filter(group=>group.resourceClass==='all service classes' || selectedGrants.some(grant=>grant.spec?.consumableRef===group.resourceClass)) : [];
   const eventOf=(item:KubeObject, stage:string, transition:string, detail:string, time?:string):FactEvent=>({id:`${stage}:${item.metadata?.uid || item.metadata?.namespace || ''}:${item.metadata?.name || ''}:${time || ''}`,time:time || item.metadata?.creationTimestamp || '',tenant:String(item.spec?.tenantRef || item.metadata?.labels?.['re8ch.com/tenant'] || '-'),trace:objectTrace(item),stage,resource:`${item.kind || stage}/${item.metadata?.namespace ? `${item.metadata.namespace}/` : ''}${item.metadata?.name || '-'}`,transition,detail:compactDetail(detail),source:item.apiVersion || 'kubernetes'});
   const factEvents:FactEvent[]=[
     ...visibleTenantViews.flatMap(view=>view.grants.map(item=>eventOf({...item,kind:'TenantGrant'},'grant',String(item.spec?.lifecycle || 'Observed'),String(item.spec?.consumableRef || '-')))),
@@ -279,7 +288,7 @@ function Dashboard() {
       <FormControl size="small" sx={{minWidth:160}}><InputLabel>Domain</InputLabel><Select value={domain} label="Domain" onChange={e=>setDomain(String(e.target.value))}><MenuItem value="">全部</MenuItem>{domains.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}</Select></FormControl>
       <TextField size="small" label="Resource contains" value={resource} onChange={e=>setResource(e.target.value)}/>
       <TextField size="small" label="Trace / task / resource" value={traceFilter} onChange={e=>setTraceFilter(e.target.value)}/>
-      <Chip label={`${resources} visible resources`}/><Chip label={`${visibleWorkloads.length} owned workloads`}/><Chip label={`${TENANT_TOOL_COUNT} Tenant tools`}/><Chip label={`${human(selectedTenantResources)} tenant resources`}/><Chip label={`${human(occupancy)} occupancy units`}/><Chip color="primary" label={`${human(score)} bifurcation score`}/><Chip color="secondary" label={`${currency} ${human(cost || selectedTenantCost)} metered cost`}/>
+      <Chip label={`${resources} visible resources`}/><Chip label={`${visibleWorkloads.length} owned workloads`}/><Chip label={`${human(selectedTenantResources)} tenant resources`}/><Chip label={`${human(occupancy)} occupancy units`}/><Chip color="primary" label={`${human(score)} bifurcation score`}/><Chip color="secondary" label={`${currency} ${human(cost || selectedTenantCost)} metered cost`}/>
     </Box>
     <Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',md:'repeat(4,1fr)'},gap:1.5,mb:2}}>
       {[
@@ -319,31 +328,38 @@ function Dashboard() {
         {header:'Granted capabilities',accessorFn:(x:TenantView)=><Box>{x.grants.map(grant=><Chip key={grant.metadata?.name} size="small" label={grant.spec?.consumableRef} sx={{mr:.5,mb:.5}}/>)}</Box>},
       ] as any}/>
     </SectionBox>
-    <SectionBox title={`${tenant || 'All tenants'} resource ring`}><ResourceRing tenant={tenant} flows={resourceFlows}/></SectionBox>
-    <SectionBox title={`Resource classes (${resourceFlows.length})`}>
-      <Table data={resourceFlows} columns={[
-        {header:'Resource class',accessorFn:(x:ResourceFlow)=><Box><Typography variant="body2">{x.label}</Typography><Typography variant="caption" color="text.secondary">{x.resourceClass}</Typography></Box>},
-        {header:'Flow',accessorFn:(x:ResourceFlow)=><StatusLabel status={x.disposition==='retained'?'success':x.disposition==='external'?'warning':'info'}>{x.disposition==='retained'?'储蓄 / 回流':x.disposition==='external'?'外部租户分流':'本租户消耗'}</StatusLabel>},
-        {header:'Observed resources',accessorFn:(x:ResourceFlow)=><Box>{x.count}<Typography variant="caption" display="block" color="text.secondary">{x.detail}</Typography></Box>},
-        {header:'Tenant tools',accessorFn:(x:ResourceFlow)=>x.toolCount},
-        {header:'External destination',accessorFn:(x:ResourceFlow)=>x.destinations.join(', ')||'-'},
+    <SectionBox title="Global resource allocation">
+      <Tabs value={resourceClass} onChange={(_event,value)=>setResourceClass(value)} variant="scrollable" scrollButtons="auto" aria-label="Resource type">
+        {globalResourceClasses.map(name=><Tab key={name} value={name} label={classLabels[name] || name}/>) }
+      </Tabs>
+      <Alert severity={selectedCapacity == null ? 'info' : 'success'} sx={{my:1}}>{selectedCapacity == null ? '该资源类尚未声明可出租容量上限，因此只展示已分配与已观测事实，不伪造“未分配”数量。' : `容量上限 ${human(selectedCapacity)}；未分配量由上限减去已分配量得到。`}</Alert>
+      <ResourceCorridors resourceClass={resourceClass} lanes={allocationLanes} capacity={selectedCapacity}/>
+    </SectionBox>
+    <SectionBox title={`Global resource classes (${globalClassRows.length})`}>
+      <Table data={globalClassRows} columns={[
+        {header:'Resource class',accessorFn:(x:any)=><Box><Typography variant="body2">{x.label}</Typography><Typography variant="caption" color="text.secondary">{x.name}</Typography></Box>},
+        {header:'Lifecycle / access',accessorFn:(x:any)=><Box><StatusLabel status={x.lifecycle==='Approved'?'success':'warning'}>{x.lifecycle}</StatusLabel><Typography variant="caption" display="block" color="text.secondary">{x.access}</Typography></Box>},
+        {header:'Capacity ceiling',accessorFn:(x:any)=>x.ceiling == null ? <StatusLabel status="warning">未声明</StatusLabel> : human(x.ceiling)},
+        {header:'Allocated / observed',accessorFn:(x:any)=>`${human(x.allocated)} / ${human(x.observed)}`},
+        {header:'Meters',accessorFn:(x:any)=>x.meters},
       ] as any}/>
     </SectionBox>
-    <SectionBox title={`Re8ch Tenant tool coverage (${TENANT_TOOL_COUNT})`}>
-      <Table data={TENANT_TOOL_GROUPS} columns={[
+    {tenant&&<SectionBox title={`${tenant} Tenant API capabilities (${selectedToolGroups.reduce((sum,group)=>sum+group.tools.length,0)})`}>
+      <Alert severity="info" sx={{mb:1}}>这里只显示当前业务租户已获授权资源类对应的 Tenant API 工具；工具数量不是资源容量，也不参与全局分配图。</Alert>
+      <Table data={selectedToolGroups} columns={[
         {header:'Resource category',accessorFn:(x:ToolGroup)=><Box><Typography variant="body2">{x.category}</Typography><Typography variant="caption" color="text.secondary">{x.resourceClass}</Typography></Box>},
         {header:'Flow class',accessorFn:(x:ToolGroup)=><StatusLabel status={x.disposition==='retained'?'success':x.disposition==='external'?'warning':'info'}>{x.disposition==='retained'?'储蓄 / 回流':x.disposition==='external'?'外部租户分流':'本租户消耗'}</StatusLabel>},
         {header:'Tools',accessorFn:(x:ToolGroup)=><Box><Chip size="small" label={`${x.tools.length} tools`} sx={{mr:.5}}/>{x.tools.map(tool=><Chip key={tool} size="small" variant="outlined" label={tool} sx={{mr:.5,mb:.5}}/>)}</Box>},
       ] as any}/>
-    </SectionBox>
-    <SectionBox title={`Owned namespace workloads (${visibleWorkloads.length})`}>
+    </SectionBox>}
+    {tenant&&<SectionBox title={`${tenant} owned namespace workloads (${visibleWorkloads.length})`}>
       <Table data={visibleWorkloads} columns={[
         {header:'Namespace / Workload',accessorFn:(x:KubeObject)=><Box><Typography variant="body2">{x.metadata?.namespace} / {x.metadata?.name}</Typography><Typography variant="caption" color="text.secondary">{x.kind}</Typography></Box>},
-        {header:'Tenant',accessorFn:(x:KubeObject)=>namespaceOwners.get(x.metadata?.namespace||'')||'-'},
+        {header:'Tenant',accessorFn:(x:KubeObject)=>objectOwner(x)||'-'},
         {header:'Harbor-backed image',accessorFn:(x:KubeObject)=>{const podSpec=x.kind==='CronJob'?x.spec?.jobTemplate?.spec?.template?.spec:x.kind==='Job'?x.spec?.template?.spec:x.spec?.template?.spec;const images=(podSpec?.containers||[]).map((container:any)=>container.image||'');const harbor=images.filter((image:string)=>image.includes('registry.re8ch.com'));return harbor.length?<StatusLabel status="success">{harbor.length} image(s)</StatusLabel>:<StatusLabel status="warning">未发现</StatusLabel>;}},
         {header:'Resource class',accessorFn:()=> 'compute.workload.v1'},
       ] as any}/>
-    </SectionBox>
+    </SectionBox>}
     <SectionBox title={`Resource branches (${visible.length})`}>
       <Table data={visible} columns={[
         {header:'Tenant / Resource',accessorFn:(x:Row)=><Box><Typography variant="body2">{x.tenant}</Typography><Typography variant="caption" color="text.secondary">{x.resource}</Typography></Box>},
